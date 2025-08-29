@@ -1,0 +1,61 @@
+﻿@* Service-driven dialog content *@
+<MudDialog>
+    <DialogContent>
+        <MudText Typo="Typo.h6" Class="mb-2">Manage roles for @Email</MudText>
+
+        @if (_items.Count > 0)
+        {
+            @foreach (var item in _items)
+            {
+                <MudCheckBox T="bool"
+                             @bind-Value="item.Selected"
+                             Label="@item.Name"
+                             Class="mb-1" />
+            }
+        }
+        else
+        {
+            <MudText Color="Color.Secondary">No roles defined.</MudText>
+        }
+    </DialogContent>
+
+    <DialogActions>
+        <MudButton OnClick="Cancel" Color="Color.Default">Cancel</MudButton>
+        <MudButton OnClick="Save" Color="Color.Primary">Save</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter] public string? Email { get; set; }
+    [Parameter] public List<RoleChoice> Roles { get; set; } = new();
+
+    // local, bindable copy to avoid parameter re-assignment pitfalls
+    private List<RoleChoice> _items = new();
+
+    protected override void OnParametersSet()
+    {
+        // clone once; keep stable references for binding
+        _items = Roles
+            .Select(r => new RoleChoice { Name = r.Name, Selected = r.Selected })
+            .OrderBy(r => r.Name)
+            .ToList();
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private void Save()
+    {
+        // return only the selected role names
+        var selected = _items.Where(x => x.Selected).Select(x => x.Name).ToList();
+        MudDialog.Close(DialogResult.Ok(selected));
+    }
+
+    // view-model
+    public class RoleChoice
+    {
+        public string Name { get; set; } = "";
+        public bool Selected { get; set; }
+    }
+}

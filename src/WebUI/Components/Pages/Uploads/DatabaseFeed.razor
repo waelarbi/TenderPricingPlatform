@@ -1,0 +1,121 @@
+﻿@page "/uploads"
+@attribute [Authorize(Policy = "RequireAdmin")]
+@using Application.Uploads
+@using MudBlazor
+@using Microsoft.AspNetCore.Components.Forms
+@inject IUploadIngestionService Ingestion
+@inject AuthenticationStateProvider AuthStateProvider
+@inject ISnackbar Snackbar
+
+<PageTitle>Database Feed</PageTitle>
+
+<MudText Typo="Typo.h5" Class="mb-3">Database Feed (Upload)</MudText>
+
+<InputFile OnChange="OnFilesSelected"
+           multiple="false"
+           accept=".xlsx,.xls"
+           style="margin-bottom:12px" />
+
+<div class="mb-2">
+    <MudSelect T="string" Label="Currency" Dense="true" @bind-Value="_currency" Style="width:160px">
+        @foreach (var c in _currencies)
+        {
+            <MudSelectItem T="string" Value="@c">@c</MudSelectItem>
+        }
+    </MudSelect>
+</div>
+
+<MudStack Row="true" Spacing="2" Class="mb-3">
+    <MudButton Color="Color.Primary" OnClick="PreviewAsync" Disabled="@(_file is null)">Preview</MudButton>
+    <MudButton Variant="Variant.Outlined" Color="Color.Success" OnClick="SaveAsync" Disabled="@(_preview is null || _preview.Rows.Count == 0)">Save</MudButton>
+    <MudButton Variant="Variant.Outlined" Color="Color.Default" OnClick="Clear">Clear</MudButton>
+</MudStack>
+
+@if (_preview is not null)
+{
+    <MudPaper Class="p-2">
+        <MudText Typo="Typo.subtitle2">File: @_preview.FileName — Sheet: @_preview.SheetName — Rows: @_preview.Rows.Count</MudText>
+
+        <MudTable Items="_preview.Rows" Dense="true" Hover="true" Bordered="true" Class="mt-2">
+            <HeaderContent>
+                <MudTh>Row</MudTh>
+                <MudTh>Pos</MudTh>
+                <MudTh>Main</MudTh>
+                <MudTh>Sub</MudTh>
+                <MudTh>SKU</MudTh>
+                <MudTh>Name</MudTh>
+                <MudTh>Size</MudTh>
+                <MudTh>Description</MudTh>
+                <MudTh>Price (@_currency)</MudTh>
+            </HeaderContent>
+            <RowTemplate>
+                <MudTd>@context.RowIndex</MudTd>
+                <MudTd>@context.Position</MudTd>
+                <MudTd>@context.MainCategory</MudTd>
+                <MudTd>@context.SubCategory</MudTd>
+                <MudTd>@context.Sku</MudTd>
+                <MudTd>@context.Name</MudTd>
+
+                <MudTd>@context.Size</MudTd>
+
+                <MudTd Style="max-width:420px;">
+                    <MudTooltip Text="@context.Description">
+                        <MudText Truncate="true">@context.Description</MudText>
+                    </MudTooltip>
+                </MudTd>
+
+                <MudTd Style="min-width:160px">
+                    <MudNumericField T="decimal?" @bind-Value="context.Price" Dense="true" HideSpinButtons="true" Placeholder="-" />
+                </MudTd>
+            </RowTemplate>
+        </MudTable>
+    </MudPaper>
+}
+
+@code {
+    private IBrowserFile? _file;
+    private string _currency = "EUR";
+    private UploadPreviewResult? _preview;
+    private readonly string[] _currencies = { "EUR", "USD" };
+
+    private void OnFilesSelected(InputFileChangeEventArgs e)
+    {
+        _file = e.FileCount > 0 ? e.File : null;
+        _preview = null;
+    }
+
+    private async Task PreviewAsync()
+    {
+        if (_file is null) return;
+
+        await using var stream = _file.OpenReadStream(maxAllowedSize: 50 * 1024 * 1024);
+        _preview = await Ingestion.PreviewExcelAsync(stream, _file.Name, CancellationToken.None);
+
+        // seed currency on rows (for Save)
+        foreach (var r in _preview.Rows)
+            r.Currency = _currency;
+
+        Snackbar.Add($"Parsed {_preview.Rows.Count} rows from {_preview.FileName}.", Severity.Success);
+    }
+
+    private async Task SaveAsync()
+    {
+        if (_preview is null) return;
+
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        var userId = auth.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? "unknown";
+
+        var saved = await Ingestion.SaveAsync(_preview, userId, _currency, CancellationToken.None);
+        Snackbar.Add($"Saved {saved} changes to database.", Severity.Success);
+
+        // reset
+        _file = null;
+        _preview = null;
+    }
+
+    private void Clear()
+    {
+        _file = null;
+        _preview = null;
+    }
+}

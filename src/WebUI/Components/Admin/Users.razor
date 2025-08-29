@@ -1,0 +1,152 @@
+﻿@page "/admin"
+@attribute [Authorize(Policy = "RequireAdmin")]
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.EntityFrameworkCore
+@using MudBlazor
+@using Infrastructure.Data
+@using Shared.Auth
+@using WebUI.Components.Dialogs
+@using System.Security.Claims
+@using System.Threading
+
+@inject UserManager<ApplicationUser> UserManager
+@inject RoleManager<IdentityRole> RoleManager
+@inject AuthenticationStateProvider AuthStateProvider
+@inject IDialogService Dialog
+@inject ISnackbar Snackbar
+@inject Application.Identity.IUserRoleService UserRoleService
+
+<PageTitle>User Management</PageTitle>
+
+<MudText Typo="Typo.h4" Class="mb-4">User Management</MudText>
+
+<MudTable Items="_users" Dense="true" Hover="true" Bordered="true" Class="mb-4">
+    <HeaderContent>
+        <MudTh>Email</MudTh>
+        <MudTh>Roles</MudTh>
+        <MudTh />
+    </HeaderContent>
+
+    <RowTemplate>
+        <MudTd>@context.Email</MudTd>
+        <MudTd>@GetRolesDisplay(context)</MudTd>
+        <MudTd>
+            <MudButton Variant="Variant.Outlined"
+                       Size="Size.Small"
+                       OnClick="@(async () => await OpenRolesAsync(context))">
+                Manage Roles
+            </MudButton>
+        </MudTd>
+    </RowTemplate>
+</MudTable>
+
+@code {
+    private List<ApplicationUser> _users = new();
+    private List<string> _allRoles = new();
+
+    // string userId -> "Role1, Role2"
+    private readonly Dictionary<string, string> _rolesDisplay = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        _users = await UserManager.Users.OrderBy(u => u.Email!).ToListAsync();
+
+        _allRoles = await RoleManager.Roles
+            .Select(r => r.Name!)
+            .OrderBy(n => n)
+            .ToListAsync();
+
+        foreach (var u in _users)
+        {
+            var roles = await UserManager.GetRolesAsync(u);
+            _rolesDisplay[u.Id] = string.Join(", ", roles);
+        }
+    }
+
+    private string GetRolesDisplay(ApplicationUser u)
+    {
+        return _rolesDisplay.TryGetValue(u.Id, out var s) ? s : string.Empty;
+    }
+
+    private async Task OpenRolesAsync(ApplicationUser user)
+    {
+        // current selections
+        var current = await UserManager.GetRolesAsync(user);
+
+        // build dialog choices
+        var choices = _allRoles
+            .Select(n => new ManageRolesDialog.RoleChoice { Name = n, Selected = current.Contains(n) })
+            .ToList();
+
+        var parameters = new DialogParameters
+        {
+            [nameof(ManageRolesDialog.Email)] = user.Email,
+            [nameof(ManageRolesDialog.Roles)] = choices
+        };
+
+        var options = new DialogOptions
+        {
+            MaxWidth = MaxWidth.Small,
+            FullWidth = true,
+            CloseButton = true,
+            BackdropClick = true,
+            Position = DialogPosition.Center
+        };
+
+        var dialogRef = await Dialog.ShowAsync<ManageRolesDialog>("Manage Roles", parameters, options);
+        var result = await dialogRef.Result;
+
+        if (result is null || result.Canceled)
+        {
+            return;
+        }
+
+        // collect desired roles from dialog
+        var desiredRoles = (result.Data as List<string>)?.ToArray() ?? Array.Empty<string>();
+
+        try
+        {
+            // acting principal from current auth state
+            var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+            var principal = auth.User;
+
+            // save using the domain service (enforces self-admin protection)
+            var save = await UserRoleService.SaveUserRolesAsync(
+                targetUserId: user.Id,
+                selectedRoles: desiredRoles,
+                actingPrincipal: principal,
+                preventSelfAdminDemotion: true,
+                ct: CancellationToken.None
+            );
+
+            // surface any errors from the domain service
+            if (save.Errors?.Count > 0)
+            {
+                foreach (var e in save.Errors)
+                {
+                    Snackbar.Add(e, Severity.Error);
+                }
+            }
+            else
+            {
+                // refresh table display
+                var rolesNow = await UserManager.GetRolesAsync(user);
+                _rolesDisplay[user.Id] = string.Join(", ", rolesNow);
+
+                // friendly success toast (with a hint of what changed, if provided)
+                var addedCount = save.Added?.Count ?? 0;
+                var removedCount = save.Removed?.Count ?? 0;
+                var msg = addedCount + removedCount > 0
+                    ? $"Roles updated. (+{addedCount}/-{removedCount})"
+                    : "No changes to roles.";
+                Snackbar.Add(msg, Severity.Success);
+
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Failed to update roles: {ex.Message}", Severity.Error);
+        }
+    }
+}

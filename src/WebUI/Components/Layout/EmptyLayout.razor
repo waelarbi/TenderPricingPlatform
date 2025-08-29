@@ -1,0 +1,11 @@
+﻿@inherits LayoutComponentBase
+@* Minimal layout: no app bar, no drawer; just providers + page body *@
+
+<MudThemeProvider />
+<MudPopoverProvider />
+<MudDialogProvider />
+<MudSnackbarProvider />
+
+<div style="min-height:100vh">
+    @Body
+</div>
