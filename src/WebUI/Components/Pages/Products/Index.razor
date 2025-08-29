@@ -1,0 +1,146 @@
+﻿@page "/products"
+@attribute [Authorize]
+@using MudBlazor
+@using Application.Products   <!-- ProductGridRow -->
+@inject IProductCatalogService Catalog
+@inject AuthenticationStateProvider Auth
+@inject ISnackbar Snackbar
+
+<MudStack Spacing="2">
+    <MudText Typo="Typo.h5">Products</MudText>
+
+    <MudStack Row="true" Spacing="2" AlignItems="AlignItems.Center">
+        <MudTextField @bind-Value="_q"
+                      Placeholder="Search SKU / name / text"
+                      Dense="true"
+                      Adornment="Adornment.Start"
+                      AdornmentIcon="@Icons.Material.Filled.Search" />
+
+        <MudSelect T="string" Dense="true" Label="Currency" Style="width:140px" @bind-Value="_currency">
+            @foreach (var c in _currencies)
+            {
+                <MudSelectItem T="string" Value="@c">@c</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudSelect T="long?" Dense="true" Label="Supplier" Style="min-width:220px" @bind-Value="_supplierId">
+            <MudSelectItem T="long?" Value="@((long?)null)">All suppliers</MudSelectItem>
+            @foreach (var s in _suppliers)
+            {
+                <MudSelectItem T="long?" Value="@((long?)s.Id)">@s.Name</MudSelectItem>
+            }
+        </MudSelect>
+
+        <MudButton OnClick="Reload" Color="Color.Primary">Apply</MudButton>
+    </MudStack>
+
+    <MudTable T="ProductGridRow"
+              @ref="_table"
+              Dense="true"
+              Hover="true"
+              Bordered="true"
+              ServerData="ServerReload"
+              RowsPerPage="_pageSize"
+              RowsPerPageOptions="new int[] { 10, 20, 50, 100 }">
+        <HeaderContent>
+            <MudTh>SKU</MudTh>
+            <MudTh>Name</MudTh>
+            <MudTh>Supplier</MudTh>
+            <MudTh>My price (@_currency)</MudTh>
+            <MudTh></MudTh>
+        </HeaderContent>
+
+        <RowTemplate>
+            <MudTd>@context.Sku</MudTd>
+            <MudTd>@context.Name</MudTd>
+            <MudTd>@context.Supplier</MudTd>
+
+            <MudTd Style="min-width:140px">
+                <MudNumericField T="decimal?"
+                                 Value="@GetEditedPrice(context.ProductId)"
+                                 ValueChanged="@(v => SetEditedPrice(context.ProductId, v))"
+                                 Dense="true"
+                                 HideSpinButtons="true"
+                                 Placeholder="@((context.MyPrice?.ToString()) ?? "-")" />
+            </MudTd>
+
+            <MudTd>
+                <MudButton Variant="Variant.Text"
+                           Color="Color.Primary"
+                           OnClick="@(()=> SaveRow(context))">
+                    Save
+                </MudButton>
+            </MudTd>
+        </RowTemplate>
+
+        <!-- Pager -->
+        <PagerContent>
+            <MudTablePager PageSizeOptions="new int[] { 10, 20, 50, 100 }" />
+        </PagerContent>
+    </MudTable>
+</MudStack>
+
+@code {
+    private MudTable<ProductGridRow>? _table;
+
+    private string _q = string.Empty;
+    private string _currency = "EUR";
+    private long? _supplierId;
+    private readonly string[] _currencies = { "EUR", "USD" };
+    private int _pageSize = 20;
+
+    private List<ProductGridRow> _rows = new();
+    private readonly Dictionary<long, decimal?> _editedPrices = new();
+
+    private List<(long Id, string Name)> _suppliers = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        _suppliers = await LoadSuppliers(); // wire this to your supplier source
+    }
+
+    private async Task<TableData<ProductGridRow>> ServerReload(TableState state, CancellationToken token)
+    {
+        var (rows, total) = await LoadPage(state.Page, state.PageSize, token);
+        _rows = rows.ToList();
+
+        foreach (var r in _rows)
+            if (!_editedPrices.ContainsKey(r.ProductId))
+                _editedPrices[r.ProductId] = r.MyPrice;
+
+        return new TableData<ProductGridRow> { Items = _rows, TotalItems = total };
+    }
+
+    private Task Reload() => _table is null ? Task.CompletedTask : _table.ReloadServerData();
+
+    private async Task<(IReadOnlyList<ProductGridRow> rows, int total)> LoadPage(int page, int pageSize, CancellationToken token)
+    {
+        var auth = await Auth.GetAuthenticationStateAsync();
+        var userId = auth.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? "unknown";
+        return await Catalog.GetPagedAsync(userId, _q, _supplierId, page, pageSize, _currency, token);
+    }
+
+    private decimal? GetEditedPrice(long productId)
+        => _editedPrices.TryGetValue(productId, out var v) ? v : null;
+
+    private void SetEditedPrice(long productId, decimal? value)
+        => _editedPrices[productId] = value;
+
+    private async Task SaveRow(ProductGridRow row)
+    {
+        var auth = await Auth.GetAuthenticationStateAsync();
+        var userId = auth.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? "unknown";
+
+        if (!_editedPrices.TryGetValue(row.ProductId, out var newPrice) || newPrice is null)
+        {
+            Snackbar.Add("Enter a price first.", Severity.Info);
+            return;
+        }
+
+        await Catalog.UpsertPriceAsync(userId, row.ProductId, _currency, newPrice.Value, CancellationToken.None);
+        Snackbar.Add($"Saved price for {row.Sku}.", Severity.Success);
+    }
+
+    private Task<List<(long Id, string Name)>> LoadSuppliers()
+        => Task.FromResult(new List<(long, string)>());
+}

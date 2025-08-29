@@ -1,8 +1,10 @@
 using Application.Identity;
+using Application.Products;
 using Application.Uploads;
 using Infrastructure.Data;
 using Infrastructure.Identity;
 using Infrastructure.Persistence;
+using Infrastructure.Services.Products;
 using Infrastructure.Services.Uploads;
 using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.AspNetCore.Identity;
@@ -34,6 +36,7 @@ namespace WebUI
             builder.Services.AddScoped<AuthenticationStateProvider, IdentityRevalidatingAuthenticationStateProvider>();
             builder.Services.AddScoped<IUserRoleService, UserRoleService>();
             builder.Services.AddScoped<IUploadIngestionService, ExcelUploadIngestionService>();
+            builder.Services.AddScoped<IProductCatalogService, ProductCatalogService>();
 
             builder.Services.AddAuthentication(options =>
                 {

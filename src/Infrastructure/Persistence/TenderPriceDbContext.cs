@@ -11,6 +11,7 @@ namespace Infrastructure.Persistence
         public DbSet<UploadedSheet> UploadedSheets => Set<UploadedSheet>();
         public DbSet<UploadedRow> UploadedRows => Set<UploadedRow>();
         public DbSet<UploadedRowMatch> UploadedRowMatches => Set<UploadedRowMatch>();
+        public DbSet<UserProductPrice> UserProductPrices => Set<UserProductPrice>();
 
         public TenderPriceDbContext(DbContextOptions<TenderPriceDbContext> options)
             : base(options) { }

@@ -164,11 +164,13 @@ namespace Infrastructure.Services.Uploads
             if (preview.IsDuplicate)
                 throw new InvalidOperationException($"Duplicate content. Already uploaded as file #{preview.DuplicateFileId} ({preview.DuplicateFileName}).");
 
+            // ----- Guard by content hash (race-safe) -----
             var contentHash = preview.ContentHash;
             if (string.IsNullOrWhiteSpace(contentHash))
             {
-                var bytes = JsonSerializer.SerializeToUtf8Bytes(preview);
-                using var ms = new MemoryStream(bytes);
+                // Fallback if older callers don’t set ContentHash:
+                var payload = JsonSerializer.SerializeToUtf8Bytes(preview);
+                using var ms = new MemoryStream(payload);
                 contentHash = await ComputeSha256Async(ms, ct);
             }
 
@@ -177,11 +179,13 @@ namespace Infrastructure.Services.Uploads
             if (dup != null)
                 throw new InvalidOperationException($"Duplicate content. Already uploaded as file #{dup.Id} ({dup.OriginalFileName}).");
 
+            // ----- Ensure unique display filename per user (“name (n).ext”) -----
             var (baseName, ext) = SplitName(preview.FileName);
             var uniqueFileName = await EnsureUniqueFileNameAsync(baseName, ext, uploadedByUserId, ct);
 
             using var tx = await _db.Database.BeginTransactionAsync(ct);
 
+            // 1) UploadedFile (principal)
             var file = new UploadedFile
             {
                 OriginalFileName = uniqueFileName,
@@ -194,15 +198,48 @@ namespace Infrastructure.Services.Uploads
             };
             _db.UploadedFiles.Add(file);
 
+            // 2) UploadedSheet (use navigation, not FK id)
             var sheet = new UploadedSheet
             {
-                UploadedFile = file, // NAVIGATION (avoid FK race)
+                UploadedFile = file,
                 SheetName = preview.SheetName,
                 RowCount = preview.Rows.Count,
                 ParseStatus = ParseStatus.Parsed
             };
             _db.UploadedSheets.Add(sheet);
 
+            // 3) Supplier upsert (from MainCategory)
+            // collect distinct, trimmed supplier names
+            var supplierNames = preview.Rows
+                .Select(r => r.MainCategory)
+                .Where(n => !string.IsNullOrWhiteSpace(n))
+                .Select(n => n!.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // load existing suppliers
+            var existingSupplierList = supplierNames.Count == 0
+                ? new List<Supplier>()
+                : await _db.Suppliers
+                    .Where(s => supplierNames.Contains(s.Name))
+                    .ToListAsync(ct); // tracked
+
+            // case-insensitive map: Name -> Supplier
+            var supplierMap = existingSupplierList
+                .ToDictionary(s => s.Name, s => s, StringComparer.OrdinalIgnoreCase);
+
+            // create missing suppliers
+            foreach (var name in supplierNames)
+            {
+                if (!supplierMap.ContainsKey(name))
+                {
+                    var s = new Supplier { Name = name };
+                    _db.Suppliers.Add(s);
+                    supplierMap[name] = s; // tracked with temp key
+                }
+            }
+
+            // 4) Preload existing SKUs (case-insensitive, nullable-safe)
             var wantedSkus = preview.Rows
                 .Where(r => !string.IsNullOrWhiteSpace(r.Sku))
                 .Select(r => r.Sku!)
@@ -218,10 +255,11 @@ namespace Infrastructure.Services.Uploads
             {
                 var existingList = await _db.ProductDescriptions
                     .Where(p => p.Sku != null && wantedSkus.Contains(p.Sku))
-                    .ToListAsync(ct); // tracked
+                    .ToListAsync(ct); // tracked so updates persist
                 existingSkus = existingList.ToDictionary(p => p.Sku!, p => p, StringComparer.OrdinalIgnoreCase);
             }
 
+            // 5) Rows + SKU upsert (link supplier)
             var rowsToAdd = new List<UploadedRow>(preview.Rows.Count);
 
             foreach (var r in preview.Rows)
@@ -230,7 +268,7 @@ namespace Infrastructure.Services.Uploads
 
                 var row = new UploadedRow
                 {
-                    UploadedSheet = sheet, // NAVIGATION
+                    UploadedSheet = sheet, // navigation
                     RowIndex = r.RowIndex,
                     Position = r.Position,
                     MainCategory = r.MainCategory,
@@ -246,6 +284,12 @@ namespace Infrastructure.Services.Uploads
                 };
                 rowsToAdd.Add(row);
 
+                // resolve supplier for this row (if any)
+                Supplier? supplier = null;
+                if (!string.IsNullOrWhiteSpace(r.MainCategory))
+                    supplierMap.TryGetValue(r.MainCategory!.Trim(), out supplier);
+
+                // upsert product by SKU
                 if (!string.IsNullOrWhiteSpace(r.Sku))
                 {
                     if (!existingSkus.TryGetValue(r.Sku!, out var pd))
@@ -257,7 +301,10 @@ namespace Infrastructure.Services.Uploads
                             Brand = r.Brand,
                             Material = r.Material,
                             SearchText = normalized,
-                            SourceFile = file // NAVIGATION
+                            SourceFile = file,     // navigation keeps FK ordering safe
+                            Supplier = supplier    // <-- link supplier if found
+                                                   // If you don't have a navigation yet, use:
+                                                   // SupplierId = supplier?.Id
                         };
                         _db.ProductDescriptions.Add(pd);
                         existingSkus[r.Sku!] = pd;
@@ -269,6 +316,13 @@ namespace Infrastructure.Services.Uploads
                         if (pd.Material == null && r.Material != null) pd.Material = r.Material;
                         if (pd.SearchText == null) pd.SearchText = normalized;
                         if (pd.SourceFile == null) pd.SourceFile = file;
+
+                        // only set supplier if empty (avoid unexpected reassignment)
+                        if (pd.Supplier == null && supplier != null)
+                            pd.Supplier = supplier;
+                        // If using FK instead:
+                        // if (pd.SupplierId == null && supplier != null)
+                        //     pd.SupplierId = supplier.Id;
                     }
                 }
             }
@@ -277,6 +331,7 @@ namespace Infrastructure.Services.Uploads
 
             var saved = await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
+
             return saved;
         }
 
