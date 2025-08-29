@@ -18,12 +18,40 @@ namespace Infrastructure.Services.Uploads
         {
             using var ms = new MemoryStream();
             await fileStream.CopyToAsync(ms, ct);
+
+            // ---- duplicate guard (by content hash) ----
+            ms.Position = 0;
+            var hash = await ComputeSha256Async(ms, ct);
+            var size = ms.Length;
             ms.Position = 0;
 
+            var existing = await _db.UploadedFiles
+                .AsNoTracking()
+                .Where(f => f.ContentHash == hash)
+                .Select(f => new { f.Id, f.OriginalFileName })
+                .FirstOrDefaultAsync(ct);
+
+            if (existing != null)
+            {
+                return new UploadPreviewResult
+                {
+                    FileName = fileName,
+                    SheetName = string.Empty,
+                    Rows = new(),
+                    ContentHash = hash,
+                    SizeBytes = size,
+                    IsDuplicate = true,
+                    DuplicateFileId = existing.Id,
+                    DuplicateFileName = existing.OriginalFileName
+                };
+            }
+
+            // ---- proceed with parsing (not a duplicate) ----
+            ms.Position = 0;
             using var wb = new XLWorkbook(ms);
             var ws = wb.Worksheets.First()!;
 
-            // ----- detect header row -----
+            // detect header row
             var headerRowNum = DetectHeaderRow(ws);
             if (headerRowNum <= 0) throw new InvalidOperationException("Header row with 'Bezeichnung' not found.");
 
@@ -41,7 +69,13 @@ namespace Infrastructure.Services.Uploads
             var bezCol = FindHeader(headerNames, "Bezeichnung", "Name", "Benennung");
             if (bezCol is null) throw new InvalidOperationException("'Bezeichnung' column not found.");
 
-            var res = new UploadPreviewResult { FileName = fileName, SheetName = ws.Name };
+            var res = new UploadPreviewResult
+            {
+                FileName = fileName,
+                SheetName = ws.Name,
+                ContentHash = hash,   // pass through to SaveAsync
+                SizeBytes = size
+            };
 
             string? currentMain = null;
             string? currentSub = null;
@@ -80,10 +114,10 @@ namespace Infrastructure.Services.Uploads
                     var descLines = lines0.Skip(1).ToList();
 
                     string? sku = ExtractSku(bez);
-                    string? brand = null;                          // ignore for now
-                    string? material = null;                       // ignore for now
+                    string? brand = null;
+                    string? material = null;
 
-                    // gather continuation lines until next Pos. (same as before)
+                    // gather continuation lines until next Pos.
                     int rr = r + 1;
                     for (; rr <= lastRow; rr++)
                     {
@@ -94,20 +128,15 @@ namespace Infrastructure.Services.Uploads
                         {
                             var extra = SplitLines(bez2);
                             descLines.AddRange(extra);
-
-                            // also try to pick SKU if not found yet
                             sku ??= ExtractSku(bez2);
                         }
                     }
 
-                    // --- NEW: robust Size extraction from description lines (single line only) ---
-                    var size = ExtractSize(descLines);
+                    var sizeVal = ExtractSize(descLines);
 
-                    // Clean description: remove any explicit SKU line
                     var description = RemoveLine(string.Join("\n", descLines),
                                                  @"(?i)\b(Artikel(?:nr|nummer)?|Art\.-?Nr)\.?:");
 
-                    // small raw dump
                     var raw = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
                     foreach (var kv in headerNames)
                     {
@@ -124,7 +153,7 @@ namespace Infrastructure.Services.Uploads
                         Name = nameLine,
                         Description = string.IsNullOrWhiteSpace(description) ? null : description,
                         Sku = sku,
-                        Size = size,                // NEW
+                        Size = sizeVal,
                         Brand = brand,
                         Material = material,
                         Raw = raw
@@ -139,85 +168,136 @@ namespace Infrastructure.Services.Uploads
 
         public async Task<int> SaveAsync(UploadPreviewResult preview, string uploadedByUserId, string currency, CancellationToken ct)
         {
-            // 1) UploadedFile
+            if (preview is null) throw new ArgumentNullException(nameof(preview));
+            if (preview.IsDuplicate)
+                throw new InvalidOperationException($"Duplicate content. Already uploaded as file #{preview.DuplicateFileId} ({preview.DuplicateFileName}).");
+
+            // Guard by hash from preview (fallback if missing)
+            var contentHash = preview.ContentHash;
+            if (string.IsNullOrWhiteSpace(contentHash))
+            {
+                var bytes = JsonSerializer.SerializeToUtf8Bytes(preview);
+                using var ms = new MemoryStream(bytes);
+                contentHash = await ComputeSha256Async(ms, ct);
+            }
+
+            var dup = await _db.UploadedFiles.AsNoTracking()
+                .FirstOrDefaultAsync(f => f.ContentHash == contentHash, ct);
+            if (dup != null)
+                throw new InvalidOperationException($"Duplicate content. Already uploaded as file #{dup.Id} ({dup.OriginalFileName}).");
+
+            // Ensure unique filename "(n)" per user
+            var (baseName, ext) = SplitName(preview.FileName);
+            var uniqueFileName = await EnsureUniqueFileNameAsync(baseName, ext, uploadedByUserId, ct);
+
+            using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+            // 1) UploadedFile (principal)
             var file = new UploadedFile
             {
-                OriginalFileName = preview.FileName,
+                OriginalFileName = uniqueFileName,
                 UploadedByUserId = uploadedByUserId,
                 UploadedUtc = DateTime.UtcNow,
-                Status = UploadedFileStatus.Parsed, // Parsed
-                Notes = "Imported via preview pipeline"
+                Status = UploadedFileStatus.Parsed,
+                Notes = "Imported via preview pipeline",
+                ContentHash = contentHash!,
+                ByteSize = preview.SizeBytes
             };
             _db.UploadedFiles.Add(file);
-            await _db.SaveChangesAsync(ct);
 
-            // 2) UploadedSheet
+            // 2) UploadedSheet (use NAVIGATION instead of FK ID)
             var sheet = new UploadedSheet
             {
-                UploadedFileId = file.Id,
+                UploadedFile = file,                         // <— important
                 SheetName = preview.SheetName,
                 RowCount = preview.Rows.Count,
                 ParseStatus = ParseStatus.Parsed
             };
             _db.UploadedSheets.Add(sheet);
-            await _db.SaveChangesAsync(ct);
 
-            // 3) Rows
+            // 3) Preload existing SKUs (tracked; no AsNoTracking so edits persist)
+            var distinctSkus = preview.Rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.Sku))
+                .Select(r => r.Sku!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            Dictionary<string, ProductDescription> existingSkus;
+            if (distinctSkus.Count == 0)
+            {
+                existingSkus = new Dictionary<string, ProductDescription>(StringComparer.OrdinalIgnoreCase);
+            }
+            else
+            {
+                var existingList = await _db.ProductDescriptions
+                    .Where(p => p.Sku != null && distinctSkus.Contains(p.Sku))
+                    .ToListAsync(ct); // tracked
+
+                existingSkus = existingList.ToDictionary(p => p.Sku!, p => p, StringComparer.OrdinalIgnoreCase);
+            }
+
+            // 4) Rows + SKU upsert (use NAVIGATIONs)
+            var rowsToAdd = new List<UploadedRow>(preview.Rows.Count);
+
             foreach (var r in preview.Rows)
             {
-                var payload = JsonSerializer.Serialize(r.Raw);
                 var normalized = BuildNormalizedText(r);
 
                 var row = new UploadedRow
                 {
-                    UploadedSheetId = sheet.Id,
+                    UploadedSheet = sheet,                   // <— important
                     RowIndex = r.RowIndex,
                     Position = r.Position,
                     MainCategory = r.MainCategory,
                     SubCategory = r.SubCategory,
                     Description = r.Description,
-                    Size = r.Size,                 // NEW
+                    Size = r.Size,
                     JsonPayload = JsonSerializer.Serialize(r.Raw),
-                    NormalizedText = BuildNormalizedText(r),
+                    NormalizedText = normalized,
                     Sku = r.Sku,
                     Name = r.Name,
-                    // Brand / Material left null for now
                     Price = r.Price,
                     Currency = r.Price.HasValue ? (r.Currency ?? currency) : null
                 };
+                rowsToAdd.Add(row);
 
-                _db.UploadedRows.Add(row);
-
-                // Optional: upsert into ProductDescription by SKU (if provided)
                 if (!string.IsNullOrWhiteSpace(r.Sku))
                 {
-                    var existing = await _db.ProductDescriptions.FirstOrDefaultAsync(p => p.Sku == r.Sku, ct);
-                    if (existing is null)
+                    if (!existingSkus.TryGetValue(r.Sku!, out var pd))
                     {
-                        _db.ProductDescriptions.Add(new ProductDescription
+                        pd = new ProductDescription
                         {
-                            Sku = r.Sku,
+                            Sku = r.Sku!,
                             Name = r.Name,
                             Brand = r.Brand,
                             Material = r.Material,
                             SearchText = normalized,
-                            SourceFileId = file.Id
-                        });
+                            SourceFile = file,                // <— important (no SourceFileId here)
+                                                              // Optionally: SourceRow = row, if you want to link a representative row
+                        };
+                        _db.ProductDescriptions.Add(pd);
+                        existingSkus[r.Sku!] = pd;
                     }
                     else
                     {
-                        existing.Name = existing.Name ?? r.Name ?? existing.Name;
-                        existing.Brand ??= r.Brand;
-                        existing.Material ??= r.Material;
-                        existing.SourceFileId ??= file.Id;
-                        existing.SearchText ??= normalized;
+                        // entity is tracked (came from ToListAsync)
+                        if (pd.Name == null && r.Name != null) pd.Name = r.Name;
+                        if (pd.Brand == null && r.Brand != null) pd.Brand = r.Brand;
+                        if (pd.Material == null && r.Material != null) pd.Material = r.Material;
+                        if (pd.SearchText == null) pd.SearchText = normalized;
+                        if (pd.SourceFile == null) pd.SourceFile = file; // <— use navigation
                     }
                 }
             }
 
+            _db.UploadedRows.AddRange(rowsToAdd);
+
             var saved = await _db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+
             return saved;
         }
+
         private static int DetectHeaderRow(IXLWorksheet ws)
         {
             var last = ws.LastRowUsed()?.RowNumber() ?? 1;
@@ -263,8 +343,7 @@ namespace Infrastructure.Services.Uploads
             return pos.Count(ch => ch == '.') + 1;
         }
 
-        private static IEnumerable<string> SplitLines(string s) =>
-            (s ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim());
+        private static IEnumerable<string> SplitLines(string? s) => (s ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim());
 
         private static string? FirstLine(string? s) => SplitLines(s ?? "").FirstOrDefault();
 
@@ -318,6 +397,43 @@ namespace Infrastructure.Services.Uploads
                 .Where(s => !string.IsNullOrWhiteSpace(s))
                 .Select(s => s!.Trim().ToLowerInvariant());
             return string.Join(' ', parts);
+        }
+
+        private static async Task<string> ComputeSha256Async(Stream s, CancellationToken ct)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            s.Position = 0;
+            var hash = await sha.ComputeHashAsync(s, ct);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        }
+
+        private static (string Base, string Ext) SplitName(string fileName)
+        {
+            var ext = Path.GetExtension(fileName);
+            var b = Path.GetFileNameWithoutExtension(fileName);
+            return (b, ext);
+        }
+
+        private async Task<string> EnsureUniqueFileNameAsync(string baseName, string ext, string userId, CancellationToken ct)
+        {
+            // if you want per-user uniqueness; drop userId filter to make it global
+            var names = await _db.UploadedFiles
+                .Where(f => f.UploadedByUserId == userId && (
+                    f.OriginalFileName == baseName + ext ||
+                    (f.OriginalFileName.StartsWith(baseName + " (") && f.OriginalFileName.EndsWith(")" + ext))
+                ))
+                .Select(f => f.OriginalFileName)
+                .ToListAsync(ct);
+
+            if (!names.Contains(baseName + ext)) return baseName + ext;
+
+            var max = 0;
+            foreach (var n in names)
+            {
+                var m = Regex.Match(n, $"^{Regex.Escape(baseName)} \\((\\d+)\\){Regex.Escape(ext)}$");
+                if (m.Success && int.TryParse(m.Groups[1].Value, out var k) && k > max) max = k;
+            }
+            return $"{baseName} ({max + 1}){ext}";
         }
     }
 }

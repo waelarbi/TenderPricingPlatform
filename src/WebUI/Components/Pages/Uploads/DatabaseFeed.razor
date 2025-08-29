@@ -6,6 +6,7 @@
 @inject IUploadIngestionService Ingestion
 @inject AuthenticationStateProvider AuthStateProvider
 @inject ISnackbar Snackbar
+@inject NavigationManager Nav
 
 <PageTitle>Database Feed</PageTitle>
 
@@ -27,49 +28,73 @@
 
 <MudStack Row="true" Spacing="2" Class="mb-3">
     <MudButton Color="Color.Primary" OnClick="PreviewAsync" Disabled="@(_file is null)">Preview</MudButton>
-    <MudButton Variant="Variant.Outlined" Color="Color.Success" OnClick="SaveAsync" Disabled="@(_preview is null || _preview.Rows.Count == 0)">Save</MudButton>
+    <MudButton Variant="Variant.Outlined" Color="Color.Success"
+               OnClick="SaveAsync"
+               Disabled="@(_preview is null || _preview.IsDuplicate || _preview.Rows.Count == 0)">
+        Save
+    </MudButton>
     <MudButton Variant="Variant.Outlined" Color="Color.Default" OnClick="Clear">Clear</MudButton>
 </MudStack>
 
 @if (_preview is not null)
 {
-    <MudPaper Class="p-2">
-        <MudText Typo="Typo.subtitle2">File: @_preview.FileName — Sheet: @_preview.SheetName — Rows: @_preview.Rows.Count</MudText>
+    @if (_preview.IsDuplicate)
+    {
+        <MudAlert Severity="Severity.Warning" Variant="Variant.Filled" Class="mb-2">
+            This file was already uploaded as
+            <b>@_preview.DuplicateFileName</b>.
+            @if (_preview.DuplicateFileId is long id)
+            {
+                <MudButton Color="Color.Primary" Variant="Variant.Filled" Class="ml-2"
+                           StartIcon="@Icons.Material.Filled.OpenInNew"
+                           OnClick="@(() => OpenExisting(id))">
+                    Open existing
+                </MudButton>
+            }
+        </MudAlert>
+    }
+    else
+    {
+        <MudPaper Class="p-2">
+            <MudText Typo="Typo.subtitle2">
+                File: @_preview.FileName — Sheet: @_preview.SheetName — Rows: @_preview.Rows.Count
+            </MudText>
 
-        <MudTable Items="_preview.Rows" Dense="true" Hover="true" Bordered="true" Class="mt-2">
-            <HeaderContent>
-                <MudTh>Row</MudTh>
-                <MudTh>Pos</MudTh>
-                <MudTh>Main</MudTh>
-                <MudTh>Sub</MudTh>
-                <MudTh>SKU</MudTh>
-                <MudTh>Name</MudTh>
-                <MudTh>Size</MudTh>
-                <MudTh>Description</MudTh>
-                <MudTh>Price (@_currency)</MudTh>
-            </HeaderContent>
-            <RowTemplate>
-                <MudTd>@context.RowIndex</MudTd>
-                <MudTd>@context.Position</MudTd>
-                <MudTd>@context.MainCategory</MudTd>
-                <MudTd>@context.SubCategory</MudTd>
-                <MudTd>@context.Sku</MudTd>
-                <MudTd>@context.Name</MudTd>
+            <MudTable Items="_preview.Rows" Dense="true" Hover="true" Bordered="true" Class="mt-2">
+                <HeaderContent>
+                    <MudTh>Row</MudTh>
+                    <MudTh>Pos</MudTh>
+                    <MudTh>Main</MudTh>
+                    <MudTh>Sub</MudTh>
+                    <MudTh>SKU</MudTh>
+                    <MudTh>Name</MudTh>
+                    <MudTh>Size</MudTh>
+                    <MudTh>Description</MudTh>
+                    <MudTh>Price (@_currency)</MudTh>
+                </HeaderContent>
+                <RowTemplate>
+                    <MudTd>@context.RowIndex</MudTd>
+                    <MudTd>@context.Position</MudTd>
+                    <MudTd>@context.MainCategory</MudTd>
+                    <MudTd>@context.SubCategory</MudTd>
+                    <MudTd>@context.Sku</MudTd>
+                    <MudTd>@context.Name</MudTd>
 
-                <MudTd>@context.Size</MudTd>
+                    <MudTd>@context.Size</MudTd>
 
-                <MudTd Style="max-width:420px;">
-                    <MudTooltip Text="@context.Description">
-                        <MudText Truncate="true">@context.Description</MudText>
-                    </MudTooltip>
-                </MudTd>
+                    <MudTd Style="max-width:420px;">
+                        <MudTooltip Text="@context.Description">
+                            <MudText Truncate="true">@context.Description</MudText>
+                        </MudTooltip>
+                    </MudTd>
 
-                <MudTd Style="min-width:160px">
-                    <MudNumericField T="decimal?" @bind-Value="context.Price" Dense="true" HideSpinButtons="true" Placeholder="-" />
-                </MudTd>
-            </RowTemplate>
-        </MudTable>
-    </MudPaper>
+                    <MudTd Style="min-width:160px">
+                        <MudNumericField T="decimal?" @bind-Value="context.Price" Dense="true" HideSpinButtons="true" Placeholder="-" />
+                    </MudTd>
+                </RowTemplate>
+            </MudTable>
+        </MudPaper>
+    }
 }
 
 @code {
@@ -91,6 +116,12 @@
         await using var stream = _file.OpenReadStream(maxAllowedSize: 50 * 1024 * 1024);
         _preview = await Ingestion.PreviewExcelAsync(stream, _file.Name, CancellationToken.None);
 
+        if (_preview.IsDuplicate)
+        {
+            StateHasChanged();
+            return; // don't seed rows or show table
+        }
+
         // seed currency on rows (for Save)
         foreach (var r in _preview.Rows)
             r.Currency = _currency;
@@ -100,17 +131,36 @@
 
     private async Task SaveAsync()
     {
-        if (_preview is null) return;
+        if (_preview is null || _preview.IsDuplicate) return;
 
         var auth = await AuthStateProvider.GetAuthenticationStateAsync();
         var userId = auth.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? "unknown";
 
-        var saved = await Ingestion.SaveAsync(_preview, userId, _currency, CancellationToken.None);
-        Snackbar.Add($"Saved {saved} changes to database.", Severity.Success);
+        try
+        {
+            var saved = await Ingestion.SaveAsync(_preview, userId, _currency, CancellationToken.None);
+            Snackbar.Add($"Saved {saved} changes to database.", Severity.Success);
 
-        // reset
-        _file = null;
-        _preview = null;
+            // reset
+            _file = null;
+            _preview = null;
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("Duplicate content"))
+        {
+            // race: someone uploaded same file between preview and save
+            Snackbar.Add("This file is already uploaded. Opening the existing one.", Severity.Warning);
+            // If your Save throws with IDs, you can navigate here.
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Save failed: {ex.Message}", Severity.Error);
+        }
+    }
+
+    private void OpenExisting(long id)
+    {
+        // TODO: update the route to your existing file details page
+        Nav.NavigateTo($"/uploads/files/{id}");
     }
 
     private void Clear()
