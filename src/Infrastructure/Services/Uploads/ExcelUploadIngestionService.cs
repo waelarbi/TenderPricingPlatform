@@ -3,6 +3,7 @@ using ClosedXML.Excel;
 using Domain.Entities;
 using Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -51,11 +52,9 @@ namespace Infrastructure.Services.Uploads
             using var wb = new XLWorkbook(ms);
             var ws = wb.Worksheets.First()!;
 
-            // detect header row
             var headerRowNum = DetectHeaderRow(ws);
             if (headerRowNum <= 0) throw new InvalidOperationException("Header row with 'Bezeichnung' not found.");
 
-            // column names present in header
             var lastCol = ws.LastColumnUsed()?.ColumnNumber() ?? 1;
             var headerNames = new Dictionary<int, string>();
             for (int c = 1; c <= lastCol; c++)
@@ -64,7 +63,6 @@ namespace Infrastructure.Services.Uploads
                 if (!string.IsNullOrEmpty(t)) headerNames[c] = t!;
             }
 
-            // find Pos. and Bezeichnung columns
             var posCol = FindHeader(headerNames, "Pos.", "Pos");
             var bezCol = FindHeader(headerNames, "Bezeichnung", "Name", "Benennung");
             if (bezCol is null) throw new InvalidOperationException("'Bezeichnung' column not found.");
@@ -73,7 +71,7 @@ namespace Infrastructure.Services.Uploads
             {
                 FileName = fileName,
                 SheetName = ws.Name,
-                ContentHash = hash,   // pass through to SaveAsync
+                ContentHash = hash,
                 SizeBytes = size
             };
 
@@ -86,13 +84,11 @@ namespace Infrastructure.Services.Uploads
                 var pos = posCol is null ? null : ws.Cell(r, posCol.Value).GetString()?.Trim();
                 var bez = GetCellConsideringMerge(ws, r, bezCol.Value);
 
-                // skip empty line
                 if (string.IsNullOrWhiteSpace(pos) && string.IsNullOrWhiteSpace(bez))
                     continue;
 
                 var level = GetLevel(pos);
 
-                // categories
                 if (level == 1)
                 {
                     currentMain = FirstLine(bez);
@@ -105,7 +101,6 @@ namespace Infrastructure.Services.Uploads
                     continue;
                 }
 
-                // only products: level >= 3
                 if (level >= 3)
                 {
                     var startRow = r;
@@ -117,7 +112,6 @@ namespace Infrastructure.Services.Uploads
                     string? brand = null;
                     string? material = null;
 
-                    // gather continuation lines until next Pos.
                     int rr = r + 1;
                     for (; rr <= lastRow; rr++)
                     {
@@ -126,16 +120,14 @@ namespace Infrastructure.Services.Uploads
                         if (!string.IsNullOrWhiteSpace(pos2)) break;
                         if (!string.IsNullOrWhiteSpace(bez2))
                         {
-                            var extra = SplitLines(bez2);
-                            descLines.AddRange(extra);
+                            descLines.AddRange(SplitLines(bez2));
                             sku ??= ExtractSku(bez2);
                         }
                     }
 
                     var sizeVal = ExtractSize(descLines);
-
                     var description = RemoveLine(string.Join("\n", descLines),
-                                                 @"(?i)\b(Artikel(?:nr|nummer)?|Art\.-?Nr)\.?:");
+                        @"(?i)\b(Artikel(?:nr|nummer)?|Art\.-?Nr)\.?:");
 
                     var raw = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
                     foreach (var kv in headerNames)
@@ -172,7 +164,6 @@ namespace Infrastructure.Services.Uploads
             if (preview.IsDuplicate)
                 throw new InvalidOperationException($"Duplicate content. Already uploaded as file #{preview.DuplicateFileId} ({preview.DuplicateFileName}).");
 
-            // Guard by hash from preview (fallback if missing)
             var contentHash = preview.ContentHash;
             if (string.IsNullOrWhiteSpace(contentHash))
             {
@@ -186,13 +177,11 @@ namespace Infrastructure.Services.Uploads
             if (dup != null)
                 throw new InvalidOperationException($"Duplicate content. Already uploaded as file #{dup.Id} ({dup.OriginalFileName}).");
 
-            // Ensure unique filename "(n)" per user
             var (baseName, ext) = SplitName(preview.FileName);
             var uniqueFileName = await EnsureUniqueFileNameAsync(baseName, ext, uploadedByUserId, ct);
 
             using var tx = await _db.Database.BeginTransactionAsync(ct);
 
-            // 1) UploadedFile (principal)
             var file = new UploadedFile
             {
                 OriginalFileName = uniqueFileName,
@@ -205,38 +194,34 @@ namespace Infrastructure.Services.Uploads
             };
             _db.UploadedFiles.Add(file);
 
-            // 2) UploadedSheet (use NAVIGATION instead of FK ID)
             var sheet = new UploadedSheet
             {
-                UploadedFile = file,                         // <— important
+                UploadedFile = file, // NAVIGATION (avoid FK race)
                 SheetName = preview.SheetName,
                 RowCount = preview.Rows.Count,
                 ParseStatus = ParseStatus.Parsed
             };
             _db.UploadedSheets.Add(sheet);
 
-            // 3) Preload existing SKUs (tracked; no AsNoTracking so edits persist)
-            var distinctSkus = preview.Rows
+            var wantedSkus = preview.Rows
                 .Where(r => !string.IsNullOrWhiteSpace(r.Sku))
                 .Select(r => r.Sku!)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
             Dictionary<string, ProductDescription> existingSkus;
-            if (distinctSkus.Count == 0)
+            if (wantedSkus.Count == 0)
             {
                 existingSkus = new Dictionary<string, ProductDescription>(StringComparer.OrdinalIgnoreCase);
             }
             else
             {
                 var existingList = await _db.ProductDescriptions
-                    .Where(p => p.Sku != null && distinctSkus.Contains(p.Sku))
+                    .Where(p => p.Sku != null && wantedSkus.Contains(p.Sku))
                     .ToListAsync(ct); // tracked
-
                 existingSkus = existingList.ToDictionary(p => p.Sku!, p => p, StringComparer.OrdinalIgnoreCase);
             }
 
-            // 4) Rows + SKU upsert (use NAVIGATIONs)
             var rowsToAdd = new List<UploadedRow>(preview.Rows.Count);
 
             foreach (var r in preview.Rows)
@@ -245,7 +230,7 @@ namespace Infrastructure.Services.Uploads
 
                 var row = new UploadedRow
                 {
-                    UploadedSheet = sheet,                   // <— important
+                    UploadedSheet = sheet, // NAVIGATION
                     RowIndex = r.RowIndex,
                     Position = r.Position,
                     MainCategory = r.MainCategory,
@@ -272,20 +257,18 @@ namespace Infrastructure.Services.Uploads
                             Brand = r.Brand,
                             Material = r.Material,
                             SearchText = normalized,
-                            SourceFile = file,                // <— important (no SourceFileId here)
-                                                              // Optionally: SourceRow = row, if you want to link a representative row
+                            SourceFile = file // NAVIGATION
                         };
                         _db.ProductDescriptions.Add(pd);
                         existingSkus[r.Sku!] = pd;
                     }
                     else
                     {
-                        // entity is tracked (came from ToListAsync)
                         if (pd.Name == null && r.Name != null) pd.Name = r.Name;
                         if (pd.Brand == null && r.Brand != null) pd.Brand = r.Brand;
                         if (pd.Material == null && r.Material != null) pd.Material = r.Material;
                         if (pd.SearchText == null) pd.SearchText = normalized;
-                        if (pd.SourceFile == null) pd.SourceFile = file; // <— use navigation
+                        if (pd.SourceFile == null) pd.SourceFile = file;
                     }
                 }
             }
@@ -294,7 +277,6 @@ namespace Infrastructure.Services.Uploads
 
             var saved = await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
-
             return saved;
         }
 
@@ -401,10 +383,10 @@ namespace Infrastructure.Services.Uploads
 
         private static async Task<string> ComputeSha256Async(Stream s, CancellationToken ct)
         {
-            using var sha = System.Security.Cryptography.SHA256.Create();
+            using var sha = SHA256.Create();
             s.Position = 0;
-            var hash = await sha.ComputeHashAsync(s, ct);
-            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+            var bytes = await sha.ComputeHashAsync(s, ct);
+            return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
         }
 
         private static (string Base, string Ext) SplitName(string fileName)
@@ -416,7 +398,6 @@ namespace Infrastructure.Services.Uploads
 
         private async Task<string> EnsureUniqueFileNameAsync(string baseName, string ext, string userId, CancellationToken ct)
         {
-            // if you want per-user uniqueness; drop userId filter to make it global
             var names = await _db.UploadedFiles
                 .Where(f => f.UploadedByUserId == userId && (
                     f.OriginalFileName == baseName + ext ||
