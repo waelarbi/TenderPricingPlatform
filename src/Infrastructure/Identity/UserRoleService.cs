@@ -1,5 +1,5 @@
 ﻿using System.Security.Claims;
-using Application.Identity;
+using Application.Abstractions.Identity;
 using Infrastructure.Data;                    // ApplicationDbContext, ApplicationUser
 using Microsoft.AspNetCore.Identity;
 

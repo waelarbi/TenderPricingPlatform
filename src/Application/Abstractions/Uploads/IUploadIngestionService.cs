@@ -1,4 +1,6 @@
-﻿namespace Application.Uploads
+﻿using Application.DTOs.Uploads;
+
+namespace Application.Abstractions.Uploads
 {
     public interface IUploadIngestionService
     {

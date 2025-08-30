@@ -1,20 +1,21 @@
 ﻿@page "/admin"
 @attribute [Authorize(Policy = "RequireAdmin")]
+@using System.Security.Claims
+@using System.Threading
+@using Application.Abstractions.Identity
+@using Infrastructure.Data
 @using Microsoft.AspNetCore.Identity
 @using Microsoft.EntityFrameworkCore
 @using MudBlazor
-@using Infrastructure.Data
 @using Shared.Auth
 @using WebUI.Components.Dialogs
-@using System.Security.Claims
-@using System.Threading
 
 @inject UserManager<ApplicationUser> UserManager
 @inject RoleManager<IdentityRole> RoleManager
 @inject AuthenticationStateProvider AuthStateProvider
 @inject IDialogService Dialog
 @inject ISnackbar Snackbar
-@inject Application.Identity.IUserRoleService UserRoleService
+@inject IUserRoleService UserRoleService
 
 <PageTitle>User Management</PageTitle>
 

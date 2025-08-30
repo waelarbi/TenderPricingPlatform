@@ -1,4 +1,4 @@
-﻿namespace Application.Uploads
+﻿namespace Application.DTOs.Uploads
 {
     public class UploadPreviewResult
     {

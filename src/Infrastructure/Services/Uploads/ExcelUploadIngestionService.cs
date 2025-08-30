@@ -1,4 +1,5 @@
-﻿using Application.Uploads;
+﻿using Application.Abstractions.Uploads;
+using Application.DTOs.Uploads;
 using ClosedXML.Excel;
 using Domain.Entities;
 using Infrastructure.Persistence;

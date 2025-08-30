@@ -1,4 +1,4 @@
-﻿namespace Application.Products
+﻿namespace Application.DTOs.Products
 {
     public sealed class ProductGridRow
     {

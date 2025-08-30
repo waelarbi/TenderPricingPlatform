@@ -1,8 +1,9 @@
 ﻿@page "/uploads"
 @attribute [Authorize(Policy = "RequireAdmin")]
-@using Application.Uploads
-@using MudBlazor
+@using Application.Abstractions.Uploads
+@using Application.DTOs.Uploads
 @using Microsoft.AspNetCore.Components.Forms
+@using MudBlazor
 @inject IUploadIngestionService Ingestion
 @inject AuthenticationStateProvider AuthStateProvider
 @inject ISnackbar Snackbar

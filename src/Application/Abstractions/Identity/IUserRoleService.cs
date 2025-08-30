@@ -1,6 +1,6 @@
 ﻿using System.Security.Claims;
 
-namespace Application.Identity;
+namespace Application.Abstractions.Identity;
 
 public sealed record SaveUserRolesResult(
     IReadOnlyList<string> Added,

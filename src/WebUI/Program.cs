@@ -1,10 +1,11 @@
-using Application.Identity;
-using Application.Products;
-using Application.Uploads;
+using Application.Abstractions.Identity;
+using Application.Abstractions.Products;
+using Application.Abstractions.Uploads;
+using Application.UseCases.Products;
 using Infrastructure.Data;
 using Infrastructure.Identity;
 using Infrastructure.Persistence;
-using Infrastructure.Services.Products;
+using Infrastructure.Persistence.Products;
 using Infrastructure.Services.Uploads;
 using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.AspNetCore.Identity;
@@ -36,7 +37,12 @@ namespace WebUI
             builder.Services.AddScoped<AuthenticationStateProvider, IdentityRevalidatingAuthenticationStateProvider>();
             builder.Services.AddScoped<IUserRoleService, UserRoleService>();
             builder.Services.AddScoped<IUploadIngestionService, ExcelUploadIngestionService>();
-            builder.Services.AddScoped<IProductCatalogService, ProductCatalogService>();
+            builder.Services.AddScoped<IProductCatalogReader, EfProductCatalogReader>();
+            builder.Services.AddScoped<ISupplierReader, EfSupplierReader>();
+            builder.Services.AddScoped<GetProductsQuery>();
+            builder.Services.AddScoped<PreviewUploadCommand>();
+            builder.Services.AddScoped<IngestUploadCommand>();
+            builder.Services.AddScoped<UpsertProductPriceCommand>();
 
             builder.Services.AddAuthentication(options =>
                 {

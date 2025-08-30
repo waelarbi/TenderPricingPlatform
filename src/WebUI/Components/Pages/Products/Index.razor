@@ -1,8 +1,12 @@
 ﻿@page "/products"
 @attribute [Authorize]
 @using MudBlazor
-@using Application.Products   <!-- ProductGridRow -->
-@inject IProductCatalogService Catalog
+@using Application.DTOs.Products
+@using Application.UseCases.Products
+@using Application.Abstractions.Products
+@inject GetProductsQuery GetProducts
+@inject UpsertProductPriceCommand UpsertPrice
+@inject ISupplierReader SupplierReader
 @inject AuthenticationStateProvider Auth
 @inject ISnackbar Snackbar
 
@@ -11,6 +15,7 @@
 
     <MudStack Row="true" Spacing="2" AlignItems="AlignItems.Center">
         <MudTextField @bind-Value="_q"
+                      Label="Search"
                       Placeholder="Search SKU / name / text"
                       Dense="true"
                       Adornment="Adornment.Start"
@@ -73,7 +78,6 @@
             </MudTd>
         </RowTemplate>
 
-        <!-- Pager -->
         <PagerContent>
             <MudTablePager PageSizeOptions="new int[] { 10, 20, 50, 100 }" />
         </PagerContent>
@@ -96,7 +100,9 @@
 
     protected override async Task OnInitializedAsync()
     {
-        _suppliers = await LoadSuppliers(); // wire this to your supplier source
+        // Load suppliers from the new reader
+        var items = await SupplierReader.GetAllAsync(CancellationToken.None);
+        _suppliers = items.Select(x => (x.Id, x.Name)).ToList();
     }
 
     private async Task<TableData<ProductGridRow>> ServerReload(TableState state, CancellationToken token)
@@ -117,7 +123,7 @@
     {
         var auth = await Auth.GetAuthenticationStateAsync();
         var userId = auth.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? "unknown";
-        return await Catalog.GetPagedAsync(userId, _q, _supplierId, page, pageSize, _currency, token);
+        return await GetProducts.ExecuteAsync(userId, _q, _supplierId, page, pageSize, _currency, token);
     }
 
     private decimal? GetEditedPrice(long productId)
@@ -137,10 +143,7 @@
             return;
         }
 
-        await Catalog.UpsertPriceAsync(userId, row.ProductId, _currency, newPrice.Value, CancellationToken.None);
+        await UpsertPrice.ExecuteAsync(userId, row.ProductId, _currency, newPrice.Value, CancellationToken.None);
         Snackbar.Add($"Saved price for {row.Sku}.", Severity.Success);
     }
-
-    private Task<List<(long Id, string Name)>> LoadSuppliers()
-        => Task.FromResult(new List<(long, string)>());
 }

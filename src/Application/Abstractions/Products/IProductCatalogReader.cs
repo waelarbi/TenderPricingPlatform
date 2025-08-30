@@ -1,6 +1,8 @@
-﻿namespace Application.Products
+﻿using Application.DTOs.Products;
+
+namespace Application.Abstractions.Products
 {
-    public interface IProductCatalogService
+    public interface IProductCatalogReader
     {
         Task<(IReadOnlyList<ProductGridRow> Rows, int Total)> GetPagedAsync(
             string userId, string? q, long? supplierId, int page, int pageSize, string currency, CancellationToken ct);
